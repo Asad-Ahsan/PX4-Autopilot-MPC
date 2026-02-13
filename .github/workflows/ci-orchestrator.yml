@@ -119,11 +119,11 @@ jobs:
   build-sitl:
     name: "T2: Build SITL Cache Seed"
     needs: [gate-checks, shellcheck, mavsdk-python-checks]
-    runs-on: [runs-on,runner=4cpu-linux-x64,image=ubuntu24-full-x64,"run-id=${{ github.run_id }}",spot=false]
+    runs-on: [runs-on,runner=4cpu-linux-x64,image=ubuntu22-full-x64,"run-id=${{ github.run_id }}",spot=false]
     permissions:
       contents: read
     container:
-      image: ghcr.io/px4/px4-dev:v1.17.0-beta1
+      image: px4io/px4-dev-simulation-focal:2024-05-18
     steps:
       - uses: runs-on/action@v2
 
