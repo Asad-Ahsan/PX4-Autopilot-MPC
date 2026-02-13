@@ -39,6 +39,8 @@ using namespace matrix;
 using math::interpolate;
 using math::radians;
 
+ModuleBase::Descriptor FixedwingRateControl::desc{task_spawn, custom_command, print_usage};
+
 FixedwingRateControl::FixedwingRateControl(bool vtol) :
 	ModuleParams(nullptr),
 	ScheduledWorkItem(MODULE_NAME, px4::wq_configurations::nav_and_controllers),
@@ -204,7 +206,7 @@ void FixedwingRateControl::Run()
 {
 	if (should_exit()) {
 		_vehicle_angular_velocity_sub.unregisterCallback();
-		exit_and_cleanup();
+		exit_and_cleanup(desc);
 		return;
 	}
 
@@ -540,8 +542,8 @@ int FixedwingRateControl::task_spawn(int argc, char *argv[])
 	FixedwingRateControl *instance = new FixedwingRateControl(vtol);
 
 	if (instance) {
-		_object.store(instance);
-		_task_id = task_id_is_work_queue;
+		desc.object.store(instance);
+		desc.task_id = task_id_is_work_queue;
 
 		if (instance->init()) {
 			return PX4_OK;
@@ -552,8 +554,8 @@ int FixedwingRateControl::task_spawn(int argc, char *argv[])
 	}
 
 	delete instance;
-	_object.store(nullptr);
-	_task_id = -1;
+	desc.object.store(nullptr);
+	desc.task_id = -1;
 
 	return PX4_ERROR;
 }
@@ -586,5 +588,5 @@ fw_rate_control is the fixed-wing rate controller.
 
 extern "C" __EXPORT int fw_rate_control_main(int argc, char *argv[])
 {
-	return FixedwingRateControl::main(argc, argv);
+	return ModuleBase::main(FixedwingRateControl::desc, argc, argv);
 }
