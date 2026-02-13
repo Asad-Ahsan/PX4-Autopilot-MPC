@@ -1,0 +1,1106 @@
+name: CI Pipeline (Orchestrator)
+
+on:
+  push:
+    branches:
+      - 'main'
+      - 'stable'
+      - 'beta'
+      - 'release/**'
+    paths-ignore:
+      - 'docs/**'
+  pull_request:
+    branches:
+      - '**'
+    paths-ignore:
+      - 'docs/**'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: read
+  pull-requests: write
+
+env:
+  MIN_FLASH_POS_DIFF_FOR_COMMENT: 50
+  MIN_FLASH_NEG_DIFF_FOR_COMMENT: -50
+
+jobs:
+  # ═══════════════════════════════════════════════════════════════════
+  # TIER 1: Quick Gate Checks (2-5 min, GitHub-hosted)
+  # These are the fastest checks that catch most common errors
+  # If any of these fail, we stop immediately to save costs
+  # ═══════════════════════════════════════════════════════════════════
+
+  gate-checks:
+    name: "T1: Gate Checks [${{ matrix.check }}]"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    container:
+      image: ghcr.io/px4/px4-dev:v1.17.0-beta1
+    strategy:
+      fail-fast: true  # Stop all jobs immediately on first failure
+      matrix:
+        check: [
+          "check_format",
+          "check_newlines"
+        ]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Setup - Configure Git Safe Directory
+        run: git config --system --add safe.directory '*'
+
+      - name: Test - Run ${{ matrix.check }}
+        run: make ${{ matrix.check }}
+
+  shellcheck:
+    name: "T1: Shellcheck"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    container:
+      image: ghcr.io/px4/px4-dev:v1.17.0-beta1
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Setup - Configure Git Safe Directory
+        run: git config --system --add safe.directory '*'
+
+      - name: Test - Run shellcheck_all
+        run: make shellcheck_all
+
+  mavsdk-python-checks:
+    name: "T1: MAVSDK Python [${{ matrix.check }}]"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: true
+      matrix:
+        check: ["mypy", "flake8"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Setup - Install Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Setup - Install Python Linters
+        run: pip install mypy types-requests flake8
+
+      - name: Test - Run mypy on MAVSDK Scripts
+        if: matrix.check == 'mypy'
+        run: mypy --strict test/mavsdk_tests/*.py
+
+      - name: Test - Run flake8 on MAVSDK Scripts
+        if: matrix.check == 'flake8'
+        run: flake8 test/mavsdk_tests/*.py
+
+  # ═══════════════════════════════════════════════════════════════════
+  # TIER 2: Builds, Analysis & Platform Checks (10-30 min, Mixed runners)
+  # Only runs if Tier 1 passes completely
+  # Uses RunsOn S3 cache for fast ccache sharing across all jobs
+  # ═══════════════════════════════════════════════════════════════════
+
+  build-sitl:
+    name: "T2: Build SITL Cache Seed"
+    needs: [gate-checks, shellcheck, mavsdk-python-checks]
+    runs-on: [runs-on,runner=4cpu-linux-x64,image=ubuntu24-full-x64,"run-id=${{ github.run_id }}",spot=false]
+    permissions:
+      contents: read
+    container:
+      image: ghcr.io/px4/px4-dev:v1.17.0-beta1
+    steps:
+      - uses: runs-on/action@v2
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup - Configure Git Safe Directory
+        run: git config --system --add safe.directory '*'
+
+      - name: Cache - Restore ccache
+        id: cache_restore
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.ccache
+          key: ccache-sitl-${{ github.ref_name }}-${{ github.sha }}
+          restore-keys: |
+            ccache-sitl-${{ github.ref_name }}-
+            ccache-sitl-${{ github.base_ref || 'main' }}-
+            ccache-sitl-
+
+      - name: Cache - Configure ccache (400M for PX4 + Gazebo plugins)
+        run: |
+          mkdir -p ~/.ccache
+          echo "base_dir = ${GITHUB_WORKSPACE}" > ~/.ccache/ccache.conf
+          echo "compression = true" >> ~/.ccache/ccache.conf
+          echo "compression_level = 6" >> ~/.ccache/ccache.conf
+          echo "max_size = 400M" >> ~/.ccache/ccache.conf
+          echo "hash_dir = false" >> ~/.ccache/ccache.conf
+          echo "compiler_check = content" >> ~/.ccache/ccache.conf
+          ccache -s
+          ccache -z
+
+      - name: Build - px4_sitl_default
+        run: make px4_sitl_default
+
+      - name: Cache - Stats after PX4 Firmware
+        run: ccache -s
+
+      - name: Build - Gazebo Classic Plugins
+        run: make px4_sitl_default sitl_gazebo-classic
+
+      - name: Cache - Stats after Gazebo Plugins
+        run: ccache -s
+
+      - name: Cache - Save ccache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.ccache
+          key: ${{ steps.cache_restore.outputs.cache-primary-key }}
+
+  basic-tests:
+    name: "T2: Basic Tests"
+    needs: [gate-checks, shellcheck, mavsdk-python-checks, build-sitl]
+    runs-on: [runs-on,runner=4cpu-linux-x64,image=ubuntu24-full-x64,"run-id=${{ github.run_id }}",spot=false]
+    permissions:
+      contents: read
+    container:
+      image: ghcr.io/px4/px4-dev:v1.17.0-beta1
+    steps:
+      - uses: runs-on/action@v2
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup - Configure Git Safe Directory
+        run: git config --system --add safe.directory '*'
+
+      - name: Cache - Restore ccache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.ccache
+          key: ccache-sitl-${{ github.ref_name }}-${{ github.sha }}
+          restore-keys: |
+            ccache-sitl-${{ github.ref_name }}-
+            ccache-sitl-${{ github.base_ref || 'main' }}-
+            ccache-sitl-
+
+      - name: Cache - Configure ccache
+        run: |
+          mkdir -p ~/.ccache
+          echo "base_dir = ${GITHUB_WORKSPACE}" > ~/.ccache/ccache.conf
+          echo "compression = true" >> ~/.ccache/ccache.conf
+          echo "compression_level = 6" >> ~/.ccache/ccache.conf
+          echo "max_size = 250M" >> ~/.ccache/ccache.conf
+          echo "hash_dir = false" >> ~/.ccache/ccache.conf
+          echo "compiler_check = content" >> ~/.ccache/ccache.conf
+          ccache -s
+          ccache -z
+
+      - name: Build - tests
+        run: make tests
+
+      - name: Build - validate_module_configs
+        run: make validate_module_configs
+
+      - name: Build - module_documentation
+        run: make module_documentation
+
+      - name: Cache - Stats
+        run: ccache -s
+
+  clang-tidy:
+    name: "T2: Clang-Tidy Static Analysis"
+    needs: [gate-checks, shellcheck, mavsdk-python-checks]
+    runs-on: [runs-on, runner=16cpu-linux-x64, "run-id=${{ github.run_id }}", "extras=s3-cache"]
+    container:
+      image: ghcr.io/px4/px4-dev:v1.17.0-beta1
+    steps:
+      - uses: runs-on/action@v2
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Setup - Configure Git Safe Directory
+        run: git config --system --add safe.directory '*'
+
+      - name: Cache - Restore ccache
+        id: cache_restore
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.ccache
+          key: ccache-clang-tidy-${{ github.ref_name }}-${{ github.sha }}
+          restore-keys: |
+            ccache-clang-tidy-${{ github.ref_name }}-
+            ccache-clang-tidy-${{ github.base_ref || 'main' }}-
+            ccache-clang-tidy-
+
+      - name: Cache - Configure ccache
+        run: |
+          mkdir -p ~/.ccache
+          echo "base_dir = ${GITHUB_WORKSPACE}" > ~/.ccache/ccache.conf
+          echo "compression = true" >> ~/.ccache/ccache.conf
+          echo "compression_level = 6" >> ~/.ccache/ccache.conf
+          echo "max_size = 250M" >> ~/.ccache/ccache.conf
+          echo "hash_dir = false" >> ~/.ccache/ccache.conf
+          echo "compiler_check = content" >> ~/.ccache/ccache.conf
+          ccache -s
+          ccache -z
+
+      - name: Test - Run Clang-Tidy
+        run: make -j16 clang-tidy
+
+      - name: Cache - Stats
+        if: always()
+        run: ccache -s
+
+      - name: Cache - Save ccache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.ccache
+          key: ${{ steps.cache_restore.outputs.cache-primary-key }}
+
+  ekf-functional-check:
+    name: "T2: EKF Change Detection"
+    needs: [gate-checks, shellcheck, mavsdk-python-checks, build-sitl]
+    if: github.event_name == 'pull_request'
+    runs-on: [runs-on,runner=4cpu-linux-x64,image=ubuntu24-full-x64,"run-id=${{ github.run_id }}",spot=false]
+    permissions:
+      contents: read
+    container:
+      image: ghcr.io/px4/px4-dev:v1.17.0-beta1
+    steps:
+      - uses: runs-on/action@v2
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup - Configure Git Safe Directory
+        run: git config --system --add safe.directory '*'
+
+      - name: Cache - Restore ccache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.ccache
+          key: ccache-sitl-${{ github.ref_name }}-${{ github.sha }}
+          restore-keys: |
+            ccache-sitl-${{ github.ref_name }}-
+            ccache-sitl-${{ github.base_ref || 'main' }}-
+            ccache-sitl-
+
+      - name: Cache - Configure ccache
+        run: |
+          mkdir -p ~/.ccache
+          echo "base_dir = ${GITHUB_WORKSPACE}" > ~/.ccache/ccache.conf
+          echo "compression = true" >> ~/.ccache/ccache.conf
+          echo "compression_level = 6" >> ~/.ccache/ccache.conf
+          echo "max_size = 250M" >> ~/.ccache/ccache.conf
+          echo "hash_dir = false" >> ~/.ccache/ccache.conf
+          echo "compiler_check = content" >> ~/.ccache/ccache.conf
+          ccache -s
+          ccache -z
+
+      - name: Test - Run EKF Tests
+        run: make tests TESTFILTER=EKF
+
+      - name: Cache - Stats
+        run: ccache -s
+
+      - name: Validate - Check for EKF Functional Changes
+        run: git diff --exit-code
+        working-directory: src/modules/ekf2/test/change_indication
+
+  ubuntu-builds:
+    name: "T2: Ubuntu Build [${{ matrix.container }}]"
+    needs: [gate-checks, shellcheck, mavsdk-python-checks]
+    runs-on: [runs-on,runner=4cpu-linux-x64,image=ubuntu24-full-x64,"run-id=${{ github.run_id }}",spot=false]
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        container: [
+          "ubuntu:22.04",
+          "ubuntu:24.04"
+        ]
+    container:
+      image: ${{ matrix.container }}
+      volumes:
+        - /github/workspace:/github/workspace
+    env:
+      RUNS_IN_DOCKER: true
+    steps:
+      - uses: runs-on/action@v2
+
+      - name: Setup - Install Git and Configure Safe Directory
+        run: |
+          apt update && apt install git -y
+          git config --global --add safe.directory $(realpath .)
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup - Install PX4 Dependencies
+        run: |
+          ./Tools/setup/ubuntu.sh --no-nuttx --no-sim-tools
+
+      - name: Cache - Restore ccache
+        id: cache_restore
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.ccache
+          key: ccache-ubuntu-${{ matrix.container }}-${{ github.ref_name }}-${{ github.sha }}
+          restore-keys: |
+            ccache-ubuntu-${{ matrix.container }}-${{ github.ref_name }}-
+            ccache-ubuntu-${{ matrix.container }}-${{ github.base_ref || 'main' }}-
+            ccache-ubuntu-${{ matrix.container }}-
+
+      - name: Cache - Configure ccache
+        run: |
+          mkdir -p ~/.ccache
+          echo "base_dir = ${GITHUB_WORKSPACE}" > ~/.ccache/ccache.conf
+          echo "compression = true" >> ~/.ccache/ccache.conf
+          echo "compression_level = 6" >> ~/.ccache/ccache.conf
+          echo "max_size = 250M" >> ~/.ccache/ccache.conf
+          echo "hash_dir = false" >> ~/.ccache/ccache.conf
+          echo "compiler_check = content" >> ~/.ccache/ccache.conf
+          ccache -s
+          ccache -z
+
+      - name: Build - px4_sitl_default
+        run: make px4_sitl_default
+
+      - name: Cache - Stats
+        run: ccache -s
+
+      - name: Cache - Save ccache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.ccache
+          key: ${{ steps.cache_restore.outputs.cache-primary-key }}
+
+  macos-build:
+    name: "T2: macOS Build"
+    needs: [gate-checks, shellcheck, mavsdk-python-checks]
+    runs-on: macos-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Setup - Install Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Cache - Restore Homebrew Packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/Library/Caches/Homebrew/downloads
+          key: macos-homebrew-${{ runner.arch }}-${{ hashFiles('Tools/setup/macos.sh') }}
+          restore-keys: |
+            macos-homebrew-${{ runner.arch }}-
+
+      - name: Cache - Restore pip Packages
+        uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/pip
+          key: macos-pip-${{ runner.arch }}-${{ hashFiles('Tools/setup/requirements.txt') }}
+          restore-keys: |
+            macos-pip-${{ runner.arch }}-
+
+      - name: Setup - Install macOS Dependencies
+        run: ./Tools/setup/macos.sh
+
+      - name: Cache - Restore ccache
+        id: cache_restore
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.ccache
+          key: ccache-macos-${{ github.ref_name }}-${{ github.sha }}
+          restore-keys: |
+            ccache-macos-${{ github.ref_name }}-
+            ccache-macos-${{ github.base_ref || 'main' }}-
+            ccache-macos-
+
+      - name: Cache - Configure ccache
+        run: |
+          mkdir -p ~/.ccache
+          echo "base_dir = ${GITHUB_WORKSPACE}" > ~/.ccache/ccache.conf
+          echo "compression = true" >> ~/.ccache/ccache.conf
+          echo "compression_level = 6" >> ~/.ccache/ccache.conf
+          echo "max_size = 400M" >> ~/.ccache/ccache.conf
+          echo "hash_dir = false" >> ~/.ccache/ccache.conf
+          echo "compiler_check = content" >> ~/.ccache/ccache.conf
+          ccache -s
+          ccache -z
+
+      - name: Build - px4_sitl (macOS)
+        run: make px4_sitl
+
+      - name: Cache - Stats after SITL
+        run: ccache -s
+
+      - name: Build - px4_fmu-v5_default
+        run: make px4_fmu-v5_default
+
+      - name: Cache - Stats after FMUv5
+        run: ccache -s
+
+      - name: Cache - Save ccache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.ccache
+          key: ${{ steps.cache_restore.outputs.cache-primary-key }}
+
+  itcm-check:
+    name: "T2: ITCM Check [${{ matrix.target }}]"
+    needs: [gate-checks, shellcheck, mavsdk-python-checks]
+    runs-on: [runs-on,runner=4cpu-linux-x64,image=ubuntu24-full-x64,"run-id=${{ github.run_id }}",spot=false]
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: px4_fmu-v5x_default
+            scripts: >
+              boards/px4/fmu-v5x/nuttx-config/scripts/itcm_gen_functions.ld
+              boards/px4/fmu-v5x/nuttx-config/scripts/itcm_static_functions.ld
+          - target: px4_fmu-v6xrt_default
+            scripts: >
+              boards/px4/fmu-v6xrt/nuttx-config/scripts/itcm_functions_includes.ld
+              boards/px4/fmu-v6xrt/nuttx-config/scripts/itcm_static_functions.ld
+          - target: nxp_tropic-community_default
+            scripts: >
+              boards/nxp/tropic-community/nuttx-config/scripts/itcm_functions_includes.ld
+              boards/nxp/tropic-community/nuttx-config/scripts/itcm_static_functions.ld
+          - target: nxp_mr-tropic_default
+            scripts: >
+              boards/nxp/mr-tropic/nuttx-config/scripts/itcm_functions_includes.ld
+              boards/nxp/mr-tropic/nuttx-config/scripts/itcm_static_functions.ld
+    container:
+      image: ghcr.io/px4/px4-dev:v1.17.0-beta1
+    steps:
+      - uses: runs-on/action@v2
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Setup - Configure Git Safe Directory
+        run: git config --system --add safe.directory '*'
+
+      - name: Build - ${{ matrix.target }}
+        run: make ${{ matrix.target }}
+
+      - name: Setup - Copy Built ELF Binary
+        run: cp ./build/**/*.elf ./built.elf
+
+      - name: Setup - Install ITCM Check Dependencies
+        run: pip3 install -r Tools/setup/optional-requirements.txt --break-system-packages
+
+      - name: Analyze - Run ITCM Placement Check
+        run: python3 Tools/itcm_check.py --elf-file built.elf --script-files ${{ matrix.scripts }}
+
+  flash-analysis:
+    name: "T2: Flash Analysis [${{ matrix.target }}]"
+    needs: [gate-checks, shellcheck, mavsdk-python-checks]
+    runs-on: [runs-on,runner=4cpu-linux-x64,image=ubuntu24-full-x64,"run-id=${{ github.run_id }}",spot=false]
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [px4_fmu-v5x, px4_fmu-v6x]
+    outputs:
+      px4_fmu-v5x-bloaty-output: ${{ steps.gen-output.outputs.px4_fmu-v5x-bloaty-output }}
+      px4_fmu-v5x-bloaty-summary-map: ${{ steps.gen-output.outputs.px4_fmu-v5x-bloaty-summary-map }}
+      px4_fmu-v6x-bloaty-output: ${{ steps.gen-output.outputs.px4_fmu-v6x-bloaty-output }}
+      px4_fmu-v6x-bloaty-summary-map: ${{ steps.gen-output.outputs.px4_fmu-v6x-bloaty-summary-map }}
+    container:
+      image: ghcr.io/px4/px4-dev:v1.17.0-beta1
+    steps:
+      - uses: runs-on/action@v2
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Setup - Configure Git Safe Directory
+        run: git config --system --add safe.directory '*'
+
+      - name: Build - ${{ matrix.target }} (Current)
+        run: make ${{ matrix.target }}_flash-analysis
+
+      - name: Analyze - Save Current ELF Binary
+        run: cp ./build/**/*.elf ./with-change.elf
+
+      - name: Setup - Clean Workspace for Baseline
+        run: |
+          make clean
+          make distclean
+          make submodulesclean
+
+      - name: Setup - Checkout PR Base Branch
+        if: ${{ github.event.pull_request }}
+        run: git checkout ${{ github.event.pull_request.base.ref }}
+
+      - name: Setup - Checkout Previous Commit
+        if: github.event_name == 'push'
+        run: git checkout ${{ github.event.before }}
+
+      - name: Setup - Update Submodules for Baseline
+        run: make submodulesupdate
+
+      - name: Build - ${{ matrix.target }} (Baseline)
+        run: make ${{ matrix.target }}_flash-analysis
+
+      - name: Analyze - Save Baseline ELF Binary
+        run: cp ./build/**/*.elf ./before-change.elf
+
+      - name: Analyze - Compare Flash Usage (Bloaty)
+        uses: PX4/bloaty-action@v1.0.0
+        id: bloaty-step
+        with:
+          bloaty-file-args: ./with-change.elf -- ./before-change.elf
+          bloaty-additional-args: -d sections,symbols -s vm -n 20
+          output-to-summary: true
+
+      - name: Analyze - Export Results for PR Comment
+        id: gen-output
+        run: |
+          EOF=$(dd if=/dev/urandom bs=15 count=1 status=none | base64)
+          echo "${{ matrix.target }}-bloaty-output<<$EOF" >> $GITHUB_OUTPUT
+          echo "${{ steps.bloaty-step.outputs.bloaty-output-encoded }}" >> $GITHUB_OUTPUT
+          echo "$EOF" >> $GITHUB_OUTPUT
+          echo "${{ matrix.target }}-bloaty-summary-map<<$EOF" >> $GITHUB_OUTPUT
+          echo '${{ steps.bloaty-step.outputs.bloaty-summary-map }}' >> $GITHUB_OUTPUT
+          echo "$EOF" >> $GITHUB_OUTPUT
+
+  post-flash-comment:
+    name: "T2: Publish Flash Analysis Results"
+    runs-on: [runs-on,runner=1cpu-linux-x64,image=ubuntu24-full-x64,"run-id=${{ github.run_id }}"]
+    needs: [flash-analysis]
+    permissions:
+      pull-requests: write
+    env:
+      V5X-SUMMARY-MAP-ABS: ${{ fromJSON(fromJSON(needs.flash-analysis.outputs.px4_fmu-v5x-bloaty-summary-map).vm-absolute) }}
+      V5X-SUMMARY-MAP-PERC: ${{ fromJSON(fromJSON(needs.flash-analysis.outputs.px4_fmu-v5x-bloaty-summary-map).vm-percentage) }}
+      V6X-SUMMARY-MAP-ABS: ${{ fromJSON(fromJSON(needs.flash-analysis.outputs.px4_fmu-v6x-bloaty-summary-map).vm-absolute) }}
+      V6X-SUMMARY-MAP-PERC: ${{ fromJSON(fromJSON(needs.flash-analysis.outputs.px4_fmu-v6x-bloaty-summary-map).vm-percentage) }}
+    if: github.event.pull_request && github.event.pull_request.head.repo.full_name == github.repository
+    steps:
+      - uses: runs-on/action@v2
+
+      - name: Setup - Find Existing Flash Comment
+        uses: peter-evans/find-comment@v3
+        id: fc
+        with:
+          issue-number: ${{ github.event.pull_request.number }}
+          comment-author: 'github-actions[bot]'
+          body-includes: FLASH Analysis
+
+      - name: Setup - Generate Comment Timestamp
+        id: bt
+        run: |
+          echo "timestamp=$(date +'%Y-%m-%dT%H:%M:%S')" >> $GITHUB_OUTPUT
+
+      - name: Upload - Post Flash Analysis to PR
+        if: |
+          steps.fc.outputs.comment-id != '' ||
+          env.V5X-SUMMARY-MAP-ABS >= fromJSON(env.MIN_FLASH_POS_DIFF_FOR_COMMENT) ||
+          env.V5X-SUMMARY-MAP-ABS <= fromJSON(env.MIN_FLASH_NEG_DIFF_FOR_COMMENT) ||
+          env.V6X-SUMMARY-MAP-ABS >= fromJSON(env.MIN_FLASH_POS_DIFF_FOR_COMMENT) ||
+          env.V6X-SUMMARY-MAP-ABS <= fromJSON(env.MIN_FLASH_NEG_DIFF_FOR_COMMENT)
+        uses: peter-evans/create-or-update-comment@v4
+        with:
+          comment-id: ${{ steps.fc.outputs.comment-id }}
+          issue-number: ${{ github.event.pull_request.number }}
+          body: |
+            ## 🔎 FLASH Analysis
+            <details>
+            <summary>px4_fmu-v5x [Total VM Diff: ${{ env.V5X-SUMMARY-MAP-ABS }} byte (${{ env.V5X-SUMMARY-MAP-PERC}} %)]</summary>
+
+            ```
+            ${{ needs.flash-analysis.outputs.px4_fmu-v5x-bloaty-output }}
+            ```
+            </details>
+
+            <details>
+            <summary>px4_fmu-v6x [Total VM Diff: ${{ env.V6X-SUMMARY-MAP-ABS }} byte (${{ env.V6X-SUMMARY-MAP-PERC }} %)]</summary>
+
+            ```
+            ${{ needs.flash-analysis.outputs.px4_fmu-v6x-bloaty-output }}
+            ```
+            </details>
+
+            **Updated: _${{ steps.bt.outputs.timestamp }}_**
+          edit-mode: replace
+
+  failsafe-sim:
+    name: "T2: Failsafe Web Simulator"
+    needs: [gate-checks, shellcheck, mavsdk-python-checks]
+    runs-on: [runs-on,runner=4cpu-linux-x64,image=ubuntu24-full-x64,"run-id=${{ github.run_id }}",spot=false]
+    permissions:
+      contents: read
+    container:
+      image: ghcr.io/px4/px4-dev:v1.17.0-beta1
+    steps:
+      - uses: runs-on/action@v2
+
+      - name: Setup - Install Node.js v20.18.0
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20.18.0
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup - Configure Git Safe Directory
+        run: git config --system --add safe.directory '*'
+
+      - name: Cache - Restore Emscripten SDK
+        id: cache-emsdk
+        uses: actions/cache@v4
+        with:
+          path: _emscripten_sdk
+          key: emsdk-4.0.15
+
+      - name: Setup - Install Emscripten
+        if: steps.cache-emsdk.outputs.cache-hit != 'true'
+        run: |
+          git clone https://github.com/emscripten-core/emsdk.git _emscripten_sdk
+          cd _emscripten_sdk
+          git checkout 4.0.15
+          ./emsdk install latest
+          ./emsdk activate latest
+
+      - name: Build - failsafe_web
+        shell: bash
+        run: |
+          source _emscripten_sdk/emsdk_env.sh
+          make failsafe_web
+
+  # ═══════════════════════════════════════════════════════════════════
+  # TIER 3: Integration Tests (30-45 min, AWS Self-hosted)
+  # Only runs if Tier 2 passes completely
+  # These are the most expensive tests - SITL simulations and ROS
+  # ═══════════════════════════════════════════════════════════════════
+
+  sitl-tests:
+    name: "T3: SITL Tests [${{ matrix.config.model }}]"
+    needs: [basic-tests, clang-tidy, ekf-functional-check, ubuntu-builds, macos-build, itcm-check, flash-analysis, failsafe-sim]
+    if: >-
+      always()
+      && needs.basic-tests.result == 'success'
+      && needs.clang-tidy.result == 'success'
+      && (needs.ekf-functional-check.result == 'success' || needs.ekf-functional-check.result == 'skipped')
+      && needs.ubuntu-builds.result == 'success'
+      && needs.macos-build.result == 'success'
+      && needs.itcm-check.result == 'success'
+      && needs.flash-analysis.result == 'success'
+    runs-on: [runs-on,runner=8cpu-linux-x64,image=ubuntu22-full-x64,"run-id=${{ github.run_id }}",spot=false]
+    permissions:
+      contents: read
+    container:
+      image: px4io/px4-dev-simulation-focal:2021-09-08
+      options: --privileged --ulimit core=-1 --security-opt seccomp=unconfined
+    strategy:
+      fail-fast: false
+      matrix:
+        config:
+          - {model: "iris", latitude: "59.617693", longitude: "-151.145316", altitude: "48", build_type: "RelWithDebInfo"} # Alaska
+          - {model: "tailsitter" ,   latitude:  "29.660316", longitude:  "-82.316658", altitude:  "30", build_type: "RelWithDebInfo" } # Florida
+          - {model: "standard_vtol", latitude:  "47.397742", longitude:    "8.545594", altitude: "488", build_type: "Coverage" } # Zurich
+    steps:
+      - uses: runs-on/action@v2
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup - Configure Git Safe Directory
+        run: git config --system --add safe.directory '*'
+
+      - name: Cache - Restore ccache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.ccache
+          key: ccache-sitl-${{ github.ref_name }}-${{ github.sha }}
+          restore-keys: |
+            ccache-sitl-${{ github.ref_name }}-
+            ccache-sitl-${{ github.base_ref || 'main' }}-
+            ccache-sitl-
+
+      - name: Cache - Configure ccache (250M, compression level 6)
+        run: |
+          mkdir -p ~/.ccache
+          echo "base_dir = ${GITHUB_WORKSPACE}" > ~/.ccache/ccache.conf
+          echo "compression = true" >> ~/.ccache/ccache.conf
+          echo "compression_level = 6" >> ~/.ccache/ccache.conf
+          echo "max_size = 250M" >> ~/.ccache/ccache.conf
+          echo "hash_dir = false" >> ~/.ccache/ccache.conf
+          echo "compiler_check = content" >> ~/.ccache/ccache.conf
+          ccache -s
+          ccache -z
+
+      - name: Build - PX4 Firmware (SITL)
+        env:
+          PX4_CMAKE_BUILD_TYPE: ${{matrix.config.build_type}}
+        run: make px4_sitl_default
+
+      - name: Cache - Stats after PX4 Firmware
+        run: ccache -s
+
+      - name: Build - Gazebo Classic Plugins
+        env:
+          PX4_CMAKE_BUILD_TYPE: ${{matrix.config.build_type}}
+        run: make px4_sitl_default sitl_gazebo-classic
+
+      - name: Cache - Stats after Gazebo Plugins
+        run: ccache -s
+
+      - name: Setup - Download MAVSDK Library
+        run: wget "https://github.com/mavlink/MAVSDK/releases/download/v$(cat test/mavsdk_tests/MAVSDK_VERSION)/libmavsdk-dev_$(cat test/mavsdk_tests/MAVSDK_VERSION)_ubuntu20.04_amd64.deb"
+
+      - name: Setup - Install MAVSDK Library
+        run: dpkg -i "libmavsdk-dev_$(cat test/mavsdk_tests/MAVSDK_VERSION)_ubuntu20.04_amd64.deb"
+
+      - name: Setup - Verify Environment Variables
+        env:
+          PX4_HOME_LAT: ${{matrix.config.latitude}}
+          PX4_HOME_LON: ${{matrix.config.longitude}}
+          PX4_HOME_ALT: ${{matrix.config.altitude}}
+          PX4_CMAKE_BUILD_TYPE: ${{matrix.config.build_type}}
+        run: |
+          export
+          ulimit -a
+
+      - name: Build - MAVSDK Integration Tests
+        env:
+          PX4_CMAKE_BUILD_TYPE: ${{matrix.config.build_type}}
+          DONT_RUN: 1
+        run: make px4_sitl_default sitl_gazebo-classic mavsdk_tests
+
+      - name: Cache - Stats after MAVSDK Tests Build
+        run: ccache -s
+
+      - name: Setup - Enable Core Dumps for Crash Analysis
+        run: |
+          ulimit -c unlimited
+          echo "`pwd`/%e.core" > /proc/sys/kernel/core_pattern
+
+      - name: Test - Run SITL MAVSDK Integration Tests
+        env:
+          PX4_HOME_LAT: ${{matrix.config.latitude}}
+          PX4_HOME_LON: ${{matrix.config.longitude}}
+          PX4_HOME_ALT: ${{matrix.config.altitude}}
+          PX4_CMAKE_BUILD_TYPE: ${{matrix.config.build_type}}
+        run: test/mavsdk_tests/mavsdk_test_runner.py --speed-factor 20 --abort-early --model ${{matrix.config.model}} test/mavsdk_tests/configs/sitl.json --verbose --force-color
+        timeout-minutes: 45
+
+      - name: Upload - Failed Test Logs and Flight Logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: failed-${{matrix.config.model}}-logs.zip
+          path: |
+            logs/**/**/**/*.log
+            logs/**/**/**/*.ulg
+            build/px4_sitl_default/tmp_mavsdk_tests/rootfs/log/**/*.ulg
+
+  ros-integration-tests:
+    name: "T3: ROS Integration Tests"
+    needs: [basic-tests, clang-tidy, ekf-functional-check, ubuntu-builds, macos-build, itcm-check, flash-analysis, failsafe-sim]
+    if: >-
+      always()
+      && needs.basic-tests.result == 'success'
+      && needs.clang-tidy.result == 'success'
+      && (needs.ekf-functional-check.result == 'success' || needs.ekf-functional-check.result == 'skipped')
+      && needs.ubuntu-builds.result == 'success'
+      && needs.macos-build.result == 'success'
+      && needs.itcm-check.result == 'success'
+      && needs.flash-analysis.result == 'success'
+    runs-on: [runs-on,runner=8cpu-linux-x64,image=ubuntu22-full-x64,"run-id=${{ github.run_id }}",spot=false]
+    permissions:
+      contents: read
+    container:
+      image: px4io/px4-dev-ros2-galactic:2021-09-08
+      options: --privileged --ulimit core=-1 --security-opt seccomp=unconfined
+    steps:
+      - uses: runs-on/action@v2
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup - Configure Git Safe Directory
+        run: git config --system --add safe.directory '*'
+
+      - name: Setup - Update ROS 2 Galactic Package Keys
+        run: |
+          sudo rm /etc/apt/sources.list.d/ros2.list && \
+          sudo curl -sSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.key -o /usr/share/keyrings/ros-archive-keyring.gpg && \
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/ros-archive-keyring.gpg] http://packages.ros.org/ros2/ubuntu $(. /etc/os-release && echo $UBUNTU_CODENAME) main" | sudo tee /etc/apt/sources.list.d/ros2.list > /dev/null
+
+      - name: Setup - Install Gazebo 11 and GStreamer Plugins
+        run: apt update && apt install -y gazebo11 libgazebo11-dev gstreamer1.0-plugins-bad gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-ugly libgstreamer-plugins-base1.0-dev
+
+      - name: Cache - Restore ccache
+        id: cache_restore
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.ccache
+          key: ccache-ros-integration-${{ github.ref_name }}-${{ github.sha }}
+          restore-keys: |
+            ccache-ros-integration-${{ github.ref_name }}-
+            ccache-ros-integration-${{ github.base_ref || 'main' }}-
+            ccache-ros-integration-
+
+      - name: Cache - Configure ccache (500M, compression level 6)
+        run: |
+          mkdir -p ~/.ccache
+          echo "base_dir = ${GITHUB_WORKSPACE}" > ~/.ccache/ccache.conf
+          echo "compression = true" >> ~/.ccache/ccache.conf
+          echo "compression_level = 6" >> ~/.ccache/ccache.conf
+          echo "max_size = 500M" >> ~/.ccache/ccache.conf
+          echo "hash_dir = false" >> ~/.ccache/ccache.conf
+          echo "compiler_check = content" >> ~/.ccache/ccache.conf
+          ccache -s
+          ccache -z
+
+      - name: Cache - Restore Micro-XRCE-DDS Agent
+        id: cache-xrce-agent
+        uses: actions/cache@v4
+        with:
+          path: /opt/Micro-XRCE-DDS-Agent
+          key: xrce-agent-v2.2.1-fastdds-2.8.2-galactic-2021-09-08
+
+      - name: Build - Micro-XRCE-DDS Agent (v2.2.1)
+        if: steps.cache-xrce-agent.outputs.cache-hit != 'true'
+        run: |
+          cd /opt
+          git clone --recursive https://github.com/eProsima/Micro-XRCE-DDS-Agent.git
+          cd Micro-XRCE-DDS-Agent
+          git checkout v2.2.1
+          sed -i 's/_fastdds_tag 2.8.x/_fastdds_tag 2.8.2/g' CMakeLists.txt
+          mkdir build
+          cd build
+          cmake ..
+          make -j2
+
+      - name: Build - PX4 ROS 2 Interface Library
+        shell: bash
+        run: |
+          PX4_DIR="$(pwd)"
+          . /opt/ros/galactic/setup.bash
+          mkdir -p /opt/px4_ws/src
+          cd /opt/px4_ws/src
+          # NOTE: On release branches, update to: git clone --recursive --branch release/X.YZ ...
+          # See docs/en/releases/release_process.md
+          git clone --recursive https://github.com/Auterion/px4-ros2-interface-lib.git
+          # Ignore python packages due to compilation issue (can be enabled when updating ROS)
+          touch px4-ros2-interface-lib/px4_ros2_py/COLCON_IGNORE || true
+          touch px4-ros2-interface-lib/examples/python/COLCON_IGNORE || true
+          cd ..
+          "${PX4_DIR}/Tools/copy_to_ros_ws.sh" "$(pwd)"
+          rm -rf src/translation_node src/px4_msgs_old
+          colcon build --symlink-install
+
+      - name: Cache - Stats after ROS 2 Interface Library
+        run: ccache -s
+
+      - name: Build - PX4 Firmware (SITL)
+        run: make px4_sitl_default
+
+      - name: Cache - Stats after PX4 Firmware
+        run: ccache -s
+
+      - name: Build - Gazebo Classic Plugins
+        run: make px4_sitl_default sitl_gazebo-classic
+
+      - name: Cache - Stats after Gazebo Plugins
+        run: ccache -s
+
+      - name: Setup - Enable Core Dumps for Crash Analysis
+        run: |
+          ulimit -c unlimited
+          echo "`pwd`/%e.core" > /proc/sys/kernel/core_pattern
+
+      - name: Test - Run ROS 2 Integration Tests (Iris model)
+        shell: bash
+        run: |
+          . /opt/px4_ws/install/setup.bash
+          /opt/Micro-XRCE-DDS-Agent/build/MicroXRCEAgent udp4 localhost -p 8888 -v 0 &
+          test/ros_test_runner.py --verbose --model iris --upload --force-color
+        timeout-minutes: 45
+
+      - name: Cache - Final Stats Summary
+        if: always()
+        run: ccache -s
+
+      - name: Cache - Save ccache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.ccache
+          key: ${{ steps.cache_restore.outputs.cache-primary-key }}
+
+      - name: Upload - Failed Test Logs and Flight Logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: failed-ros-logs.zip
+          path: |
+            logs/**/**/**/*.log
+            logs/**/**/**/*.ulg
+            build/px4_sitl_default/tmp_ros_tests/rootfs/log/**/*.ulg
+
+  mavros-tests:
+    name: "T3: MAVROS Tests [${{ matrix.config.name }}]"
+    needs: [basic-tests, clang-tidy, ekf-functional-check, ubuntu-builds, macos-build, itcm-check, flash-analysis, failsafe-sim]
+    if: >-
+      always()
+      && needs.basic-tests.result == 'success'
+      && needs.clang-tidy.result == 'success'
+      && (needs.ekf-functional-check.result == 'success' || needs.ekf-functional-check.result == 'skipped')
+      && needs.ubuntu-builds.result == 'success'
+      && needs.macos-build.result == 'success'
+      && needs.itcm-check.result == 'success'
+      && needs.flash-analysis.result == 'success'
+    runs-on: [runs-on,runner=4cpu-linux-x64,image=ubuntu22-full-x64,"run-id=${{ github.run_id }}",spot=false]
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        config:
+          - {name: "Mission", test_file: "mavros_posix_test_mission.test", params: "mission:=MC_mission_box vehicle:=iris"}
+          - {name: "Offboard", test_file: "mavros_posix_tests_offboard_posctl.test", params: "vehicle:=iris"}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # PX4 fork of addnab/docker-run-action with Docker API v1.44+ support
+      # Use docker-run-action instead of container: at job level because:
+      # - ROS Melodic container is based on Ubuntu 18.04 (GLIBC 2.27)
+      # - GitHub Actions' container: support injects Node 20 which requires GLIBC 2.28+
+      # - docker-run-action runs the container separately, avoiding GLIBC compatibility issues
+      # - This approach is future-proof as GitHub updates Node versions
+      # TODO: Migrate to a newer ROS container with latest Ubuntu that meets GLIBC requirements
+      #       to use native container support and simplify the workflow configuration
+      - name: Build and Test - MAVROS ${{ matrix.config.name }}
+        run: |
+          docker run --rm \
+            -v "${GITHUB_WORKSPACE}:/workspace" \
+            -w /workspace \
+            px4io/px4-dev-ros-melodic:2021-09-08 \
+            bash -c '
+              git config --global --add safe.directory /workspace
+              make px4_sitl_default
+              make px4_sitl_default sitl_gazebo-classic
+              ./test/rostest_px4_run.sh \
+                ${{ matrix.config.test_file }} \
+                ${{ matrix.config.params }}
+            '
+
+  ros-translation-node:
+    name: "T3: ROS Translation Node [${{ matrix.config.ros_version }}]"
+    needs: [basic-tests, clang-tidy, ekf-functional-check, ubuntu-builds, macos-build, itcm-check, flash-analysis, failsafe-sim]
+    if: >-
+      always()
+      && needs.basic-tests.result == 'success'
+      && needs.clang-tidy.result == 'success'
+      && (needs.ekf-functional-check.result == 'success' || needs.ekf-functional-check.result == 'skipped')
+      && needs.ubuntu-builds.result == 'success'
+      && needs.macos-build.result == 'success'
+      && needs.itcm-check.result == 'success'
+      && needs.flash-analysis.result == 'success'
+    runs-on: [runs-on,runner=4cpu-linux-x64,image=ubuntu24-full-x64,"run-id=${{ github.run_id }}",spot=false]
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        config:
+          - {ros_version: "humble", ubuntu: "jammy"}
+          - {ros_version: "jazzy", ubuntu: "noble"}
+    container:
+      image: rostooling/setup-ros-docker:ubuntu-${{ matrix.config.ubuntu }}-latest
+    steps:
+      - uses: runs-on/action@v2
+
+      - name: Setup - Install ROS 2 ${{ matrix.config.ros_version }}
+        uses: ros-tooling/setup-ros@v0.7
+        with:
+          required-ros-distributions: ${{ matrix.config.ros_version }}
+
+      - name: Setup - Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup - Configure Git Safe Directory
+        run: git config --system --add safe.directory '*'
+
+      - name: Validate - Check Message File Versioning
+        if: github.event_name == 'pull_request'
+        shell: bash
+        run: |
+          ./Tools/ci/check_msg_versioning.sh ${{ github.event.pull_request.base.sha }} ${{github.event.pull_request.head.sha}}
+
+      - name: Build and Test - Translation Node Unit Tests
+        shell: bash
+        run: |
+          ros_ws=/ros_ws
+          mkdir -p $ros_ws/src
+          ./Tools/copy_to_ros_ws.sh $ros_ws
+          cd $ros_ws
+          source /opt/ros/${{ matrix.config.ros_version }}/setup.sh
+          colcon build --cmake-args -DCMAKE_BUILD_TYPE=Release --symlink-install --event-handlers=console_cohesion+
+          source ./install/setup.sh
+          ./build/translation_node/translation_node_unit_tests
+
+  # ═══════════════════════════════════════════════════════════════════
+  # TIER 4: Full Build Matrix (30-60 min, AWS 8cpu)
+  # Runs via build_all_targets.yml workflow after orchestrator completes
+  # This is the most expensive job - builds all ~200 board targets
+  # ═══════════════════════════════════════════════════════════════════
+  # The build_all_targets.yml workflow is triggered automatically when:
+  # 1. This orchestrator workflow completes successfully (any branch/PR)
+  # 2. A tagged release is pushed (v*)
+  # See: .github/workflows/build_all_targets.yml
