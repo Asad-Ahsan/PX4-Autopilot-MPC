@@ -38,7 +38,7 @@
  * @author Lorenz Meier <lorenz@px4.io>
  * @author Anton Babushkin <anton@px4.io>
  */
-
+#include <parameters/param.h>
 /**
  * Roll P gain
  *
@@ -158,3 +158,15 @@ PARAM_DEFINE_FLOAT(MC_YAWRATE_MAX, 200.0f);
  * @group Multicopter Position Control
  */
 PARAM_DEFINE_FLOAT(MC_MAN_TILT_TAU, 0.0f);
+
+/**
+ * Manual stick deadzone
+ *
+ * Deadzone applied to manual control stick input.
+ *
+ * @min 0.0
+ * @max 0.5
+ * @decimal 2
+ */
+PARAM_DEFINE_FLOAT(MAN_DEADZONE, 0.05f);
+

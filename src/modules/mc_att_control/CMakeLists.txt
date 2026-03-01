@@ -36,6 +36,7 @@ add_subdirectory(AttitudeControl)
 px4_add_module(
 	MODULE modules__mc_att_control
 	MAIN mc_att_control
+	STACK_MAIN 2048
 	COMPILE_FLAGS
 		${MAX_CUSTOM_OPT_LEVEL}
 	SRCS

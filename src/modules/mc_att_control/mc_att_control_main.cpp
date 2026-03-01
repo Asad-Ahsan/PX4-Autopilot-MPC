@@ -1,6 +1,6 @@
 /****************************************************************************
  *
- *   Copyright (c) 2013-2018 PX4 Development Team. All rights reserved.
+ *   Copyright (c) 2013-2025 PX4 Development Team. All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -34,24 +34,64 @@
 /**
  * @file mc_att_control_main.cpp
  * Multicopter attitude controller.
- *
- * @author Lorenz Meier		<lorenz@px4.io>
- * @author Anton Babushkin	<anton.babushkin@me.com>
- * @author Sander Smeets	<sander@droneslab.com>
- * @author Matthias Grob	<maetugr@gmail.com>
- * @author Beat Küng		<beat-kueng@gmx.net>
- *
  */
 
+#include <matrix/matrix/math.hpp>
 #include "mc_att_control.hpp"
-
 #include <drivers/drv_hrt.h>
 #include <mathlib/math/Limits.hpp>
 #include <mathlib/math/Functions.hpp>
-
 #include "AttitudeControl/AttitudeControlMath.hpp"
+#include <cmath>
 
 using namespace matrix;
+
+// Constant matrices (computed once, never change)
+matrix::SquareMatrix<float, 6>  MulticopterAttitudeControl::_E_inv{};
+matrix::Matrix<float, 6, 24>    MulticopterAttitudeControl::_CC_trans{};
+matrix::SquareMatrix<float, 24> MulticopterAttitudeControl::_T{};
+matrix::Matrix<float, 24, 6>    MulticopterAttitudeControl::_CC{};
+matrix::Matrix<float, 24, 1>    MulticopterAttitudeControl::_dd{};
+matrix::Matrix<float, 24, 3>    MulticopterAttitudeControl::_dupast{};
+matrix::Matrix<float, 15, 9>    MulticopterAttitudeControl::_P{};
+matrix::Matrix<float, 15, 6>    MulticopterAttitudeControl::_H{};
+matrix::Matrix<float, 6, 15>    MulticopterAttitudeControl::_H_trans{};
+matrix::SquareMatrix<float, 6>  MulticopterAttitudeControl::_W{};
+
+// Working vectors
+matrix::Vector<float, 6>  MulticopterAttitudeControl::_tempEF{};
+matrix::Vector<float, 24> MulticopterAttitudeControl::_Kvec{};
+matrix::Vector<float, 24> MulticopterAttitudeControl::_lambda{};
+matrix::Vector<float, 24> MulticopterAttitudeControl::_lambda_prev{};
+matrix::Vector<float, 6>  MulticopterAttitudeControl::_tempVec6{};
+matrix::Vector<float, 6>  MulticopterAttitudeControl::_tempV6_2{};
+matrix::Vector<float, 6>  MulticopterAttitudeControl::_DeltaU{};
+matrix::Vector<float, 6>  MulticopterAttitudeControl::_F{};
+matrix::Vector<float, 24> MulticopterAttitudeControl::_d_local{};
+
+// State / control
+matrix::Matrix<float, 6, 1> MulticopterAttitudeControl::_x{};
+matrix::Matrix<float, 3, 1> MulticopterAttitudeControl::_u{};
+matrix::Matrix<float, 9, 1> MulticopterAttitudeControl::_Xf{};
+matrix::Matrix<float, 3, 1> MulticopterAttitudeControl::_des{};
+
+// System matrices
+matrix::Matrix<float, 6, 6> MulticopterAttitudeControl::_Ad{};
+matrix::Matrix<float, 6, 3> MulticopterAttitudeControl::_Bd{};
+matrix::Matrix<float, 3, 6> MulticopterAttitudeControl::_Cd{};
+
+// Temporaries
+matrix::Matrix<float, 15, 1> MulticopterAttitudeControl::_temp15{};
+matrix::Matrix<float, 6,  1> MulticopterAttitudeControl::_temp6{};
+matrix::Matrix<float, 3,  1> MulticopterAttitudeControl::_delta_first{};
+matrix::Matrix<float, 6,  1> MulticopterAttitudeControl::_x_diff{};
+matrix::Matrix<float, 3,  1> MulticopterAttitudeControl::_y_out{};
+matrix::Matrix<float, 15, 3> MulticopterAttitudeControl::_Rs{};
+matrix::Matrix<float, 6, 1> MulticopterAttitudeControl::_x_prev{};
+
+// =============================================================================
+// CONSTRUCTOR
+// =============================================================================
 
 MulticopterAttitudeControl::MulticopterAttitudeControl(bool vtol) :
 	ModuleParams(nullptr),
@@ -60,13 +100,173 @@ MulticopterAttitudeControl::MulticopterAttitudeControl(bool vtol) :
 	_loop_perf(perf_alloc(PC_ELAPSED, MODULE_NAME": cycle")),
 	_vtol(vtol)
 {
-
 	parameters_updated();
+
+	_manual_throttle_minimum.setSlewRate(0.05f);
+	_manual_throttle_minimum.update(0.0f, 0.0f);
+	_manual_throttle_maximum.setSlewRate(0.5f);
+	_manual_throttle_maximum.update(0.0f, 0.0f);
+	_hover_thrust_slew_rate.setSlewRate(0.05f);
+	_hover_thrust_slew_rate.update(_param_mpc_thr_hover.get(), 0.0f);
+
+	// =========================================================================
+	// MPC ONE-TIME INITIALISATION
+	// Everything here is computed exactly once at startup.
+	// =========================================================================
+
+	reset_mpc_state();
+	_rates_sp.zero();
+	_att_control.zero();
+
+	// ----- H matrix (15x6) -----
+	static const float H_data[15][6] = {
+		{81.1688f,0,0,0,0,0},
+		{0,63.1712f,0,0,0,0},
+		{0,0,47.3934f,0,0,0},
+		{162.3377f,0,0,81.1688f,0,0},
+		{0,126.3424f,0,0,63.1712f,0},
+		{0,0,94.7867f,0,0,47.3934f},
+		{243.5065f,0,0,162.3377f,0,0},
+		{0,189.5136f,0,0,126.3424f,0},
+		{0,0,142.1801f,0,0,94.7867f},
+		{324.6753f,0,0,243.5065f,0,0},
+		{0,252.6848f,0,0,189.5136f,0},
+		{0,0,189.5735f,0,0,142.1801f},
+		{405.8442f,0,0,324.6753f,0,0},
+		{0,315.8560f,0,0,252.6848f,0},
+		{0,0,236.9668f,0,0,189.5735f}
+	};
+	_H.zero();
+	for (int i = 0; i < 15; i++)
+		for (int j = 0; j < 6; j++)
+			_H(i,j) = H_data[i][j];
+
+	// ----- P matrix (15x9) -----
+	static const float P_data[15][9] = {
+		{0,0,0,0,0,0,1,0,0},
+		{0,0,0,0,0,0,0,1,0},
+		{0,0,0,0,0,0,0,0,1},
+		{0,1,0,0,0,0,1,0,0},
+		{0,0,0,1,0,0,0,1,0},
+		{0,0,0,0,0,1,0,0,1},
+		{0,2,0,0,0,0,1,0,0},
+		{0,0,0,2,0,0,0,1,0},
+		{0,0,0,0,0,2,0,0,1},
+		{0,3,0,0,0,0,1,0,0},
+		{0,0,0,3,0,0,0,1,0},
+		{0,0,0,0,0,3,0,0,1},
+		{0,4,0,0,0,0,1,0,0},
+		{0,0,0,4,0,0,0,1,0},
+		{0,0,0,0,0,4,0,0,1}
+	};
+	_P.zero();
+	for (int i = 0; i < 15; i++)
+		for (int j = 0; j < 9; j++)
+			_P(i,j) = P_data[i][j];
+
+	// ----- W matrix (6x6) -----
+	_W.zero();
+	_W(0,0) = 0.075f * 0.5f;
+	_W(1,1) = 0.075f * 0.5f;
+	_W(2,2) = 0.045f * 0.5f;
+	_W(3,3) = 0.075f * 0.5f;
+	_W(4,4) = 0.075f * 0.5f;
+	_W(5,5) = 0.045f * 0.5f;
+
+	// ----- E = 2*(H'*H + W),  E_inv = E^{-1} -----
+	_H_trans = _H.transpose();
+	SquareMatrix<float,6> E = (SquareMatrix<float,6>)(_H_trans * _H);
+	E += _W;
+	E *= 2.0f;
+	_E_inv = E.I();
+
+	// ----- CC matrix (24x6) -----
+	static const float CC_data[24][6] = {
+		{ 1, 0, 0, 0, 0, 0}, { 0, 1, 0, 0, 0, 0}, { 0, 0, 1, 0, 0, 0},
+		{ 0, 0, 0, 1, 0, 0}, { 0, 0, 0, 0, 1, 0}, { 0, 0, 0, 0, 0, 1},
+		{-1, 0, 0, 0, 0, 0}, { 0,-1, 0, 0, 0, 0}, { 0, 0,-1, 0, 0, 0},
+		{ 0, 0, 0,-1, 0, 0}, { 0, 0, 0, 0,-1, 0}, { 0, 0, 0, 0, 0,-1},
+		{ 1, 0, 0, 0, 0, 0}, { 0, 1, 0, 0, 0, 0}, { 0, 0, 1, 0, 0, 0},
+		{ 1, 0, 0, 1, 0, 0}, { 0, 1, 0, 0, 1, 0}, { 0, 0, 1, 0, 0, 1},
+		{-1, 0, 0, 0, 0, 0}, { 0,-1, 0, 0, 0, 0}, { 0, 0,-1, 0, 0, 0},
+		{-1, 0, 0,-1, 0, 0}, { 0,-1, 0, 0,-1, 0}, { 0, 0,-1, 0, 0,-1}
+	};
+	_CC.zero();
+	for (int i = 0; i < 24; i++)
+		for (int j = 0; j < 6; j++)
+			_CC(i,j) = CC_data[i][j];
+
+	_CC_trans = _CC.transpose();
+
+	// ----- dd vector (24x1) -----
+	static const float dd_data[24] = {
+		0.4796f,0.4796f,0.1161f, 0.4796f,0.4796f,0.1161f,
+		0.4796f,0.4796f,0.1161f, 0.4796f,0.4796f,0.1161f,
+		0.7794f,0.7794f,0.1935f, 0.7794f,0.7794f,0.1935f,
+		0.7794f,0.7794f,0.1935f, 0.7794f,0.7794f,0.1935f
+	};
+	_dd.zero();
+	for (int i = 0; i < 24; i++) _dd(i,0) = dd_data[i];
+
+	// ----- dupast matrix (24x3) -----
+	static const float dupast_data[24][3] = {
+		{0,0,0},{0,0,0},{0,0,0},{0,0,0},{0,0,0},{0,0,0},
+		{0,0,0},{0,0,0},{0,0,0},{0,0,0},{0,0,0},{0,0,0},
+		{-1,0,0},{0,-1,0},{0,0,-1},
+		{-1,0,0},{0,-1,0},{0,0,-1},
+		{ 1,0,0},{0, 1,0},{0,0, 1},
+		{ 1,0,0},{0, 1,0},{0,0, 1}
+	};
+	_dupast.zero();
+	for (int i = 0; i < 24; i++)
+		for (int j = 0; j < 3; j++)
+			_dupast(i,j) = dupast_data[i][j];
+
+	_T.zero();
+	for (int i = 0; i < 24; i++) {
+		for (int j = 0; j < 24; j++) {
+			float sum = 0.f;
+			for (int k = 0; k < 6; k++)
+				for (int m = 0; m < 6; m++)
+					sum += _CC(i,k) * _E_inv(k,m) * _CC(j,m);
+			_T(i,j) = sum;
+		}
+	}
+
+	_Bd.zero();
+	_Bd(0,0) = 0.0032468f; _Bd(1,0) = 1.62338f;
+	_Bd(2,1) = 0.0025268f; _Bd(3,1) = 1.26342f;
+	_Bd(4,2) = 0.0018957f; _Bd(5,2) = 0.94786f;
+
+	_Cd.zero();
+	_Cd(0,1) = 1.f;
+	_Cd(1,3) = 1.f;
+	_Cd(2,5) = 1.f;
+
+	// Rs is also constant (block-diagonal identity stacked 5 times)
+	_Rs.zero();
+	for (int i = 0; i < 5; i++) {
+		_Rs(i*3+0, 0) = 1.f;
+		_Rs(i*3+1, 1) = 1.f;
+		_Rs(i*3+2, 2) = 1.f;
+	}
+	_mpc_initialized = true;
+	PX4_INFO("MPC controller initialised");
 }
 
 MulticopterAttitudeControl::~MulticopterAttitudeControl()
 {
 	perf_free(_loop_perf);
+}
+
+void MulticopterAttitudeControl::reset_mpc_state()
+{
+	_x.zero();
+	_u.zero();
+	_Xf.zero();
+	_x_prev.zero();
+	_des.zero();
+	_att_control.zero();
 }
 
 bool
@@ -76,118 +276,259 @@ MulticopterAttitudeControl::init()
 		PX4_ERR("callback registration failed");
 		return false;
 	}
-
+	reset_mpc_state();
 	return true;
 }
 
 void
 MulticopterAttitudeControl::parameters_updated()
 {
-	// Store some of the parameters in a more convenient way & precompute often-used values
-	_attitude_control.setProportionalGain(Vector3f(_param_mc_roll_p.get(), _param_mc_pitch_p.get(), _param_mc_yaw_p.get()),
-					      _param_mc_yaw_weight.get());
+	_attitude_control.setProportionalGain(
+		Vector3f(_param_mc_roll_p.get(), _param_mc_pitch_p.get(), _param_mc_yaw_p.get()),
+		_param_mc_yaw_weight.get());
 
-	// angular rate limits
 	using math::radians;
-	_attitude_control.setRateLimit(Vector3f(radians(_param_mc_rollrate_max.get()), radians(_param_mc_pitchrate_max.get()),
-						radians(_param_mc_yawrate_max.get())));
+	_attitude_control.setRateLimit(Vector3f(
+		radians(_param_mc_rollrate_max.get()),
+		radians(_param_mc_pitchrate_max.get()),
+		radians(_param_mc_yawrate_max.get())));
+
+	if (!PX4_ISFINITE(_hover_thrust_estimate)) {
+		_hover_thrust_slew_rate.setForcedValue(_param_mpc_thr_hover.get());
+	}
 
 	_man_tilt_max = math::radians(_param_mpc_man_tilt_max.get());
 }
 
+// =============================================================================
+// QP SOLVER — Hildreth's method
+// =============================================================================
+
+void MulticopterAttitudeControl::QPhild()
+{
+	// Step 1 — tempEF = E_inv * F  (6×1)
+	for (int i = 0; i < 6; i++) {
+		_tempEF(i) = 0.f;
+		for (int j = 0; j < 6; j++)
+			_tempEF(i) += _E_inv(i,j) * _F(j);
+	}
+
+	// Step 2 — Kvec = CC * tempEF + d_local  (24×1)
+	for (int i = 0; i < 24; i++) {
+		_Kvec(i) = 0.f;
+		for (int j = 0; j < 6; j++)
+			_Kvec(i) += _CC(i,j) * _tempEF(j);
+		_Kvec(i) += _d_local(i);
+	}
+
+	for (int i = 0; i < 24; i++) {
+		_lambda(i)      = 0.f;
+		_lambda_prev(i) = 0.f;
+	}
+
+	for (int km = 0; km < 10; km++) {
+		for (int i = 0; i < 24; i++) _lambda_prev(i) = _lambda(i);
+
+		for (int i = 0; i < 24; i++) {
+			float Tii = _T(i,i);
+			if (fabsf(Tii) < 1e-10f) continue;
+
+			float dot = 0.f;
+			for (int k = 0; k < 24; k++)
+				if (k != i) dot += _T(k,i) * _lambda(k);
+			float la = -(dot + _Kvec(i)) / _T(i,i);
+			_lambda(i) = (la < 0.f) ? 0.f : la;
+		}
+
+		float al = 0.f;
+		for (int i = 0; i < 24; i++) {
+			float d = _lambda(i) - _lambda_prev(i);
+			al += d * d;
+		}
+		if (al < 0.001f) break;
+	}
+
+	// Step 4 — DeltaU = -E_inv*(F + CC'*lambda)
+	for (int i = 0; i < 6; i++) {
+		_tempVec6(i) = 0.f;
+		for (int j = 0; j < 24; j++)
+			_tempVec6(i) += _CC(j,i) * _lambda(j);
+	}
+	for (int i = 0; i < 6; i++) {
+		_tempV6_2(i) = 0.f;
+		for (int j = 0; j < 6; j++)
+			_tempV6_2(i) += _E_inv(i,j) * _tempVec6(j);
+	}
+	for (int i = 0; i < 6; i++)
+		_DeltaU(i) = -_tempEF(i) - _tempV6_2(i);
+}
+
+// =============================================================================
+// RATE CONTROLLER
+// =============================================================================
+
+void MulticopterAttitudeControl::control_attitude_rates(float dt,
+        const matrix::Vector3f &rates, const matrix::Quatf &q)
+{
+
+	_Ad.zero();
+	_Ad(0,0) = 1.f; _Ad(0,1) = dt;
+	_Ad(1,1) = 1.f;
+	_Ad(2,2) = 1.f; _Ad(2,3) = dt;
+	_Ad(3,3) = 1.f;
+	_Ad(4,4) = 1.f; _Ad(4,5) = dt;
+	_Ad(5,5) = 1.f;
+
+	const matrix::Eulerf euler{q};
+
+	_x(0,0) = euler.phi();    // roll angle
+	_x(1,0) = rates(0);       // roll rate  p
+	_x(2,0) = euler.theta();  // pitch angle
+	_x(3,0) = rates(1);       // pitch rate q
+	_x(4,0) = euler.psi();    // yaw angle
+	_x(5,0) = rates(2);       // yaw rate   r
+
+	_des(0,0) = _rates_sp(0);
+	_des(1,0) = _rates_sp(1);
+	_des(2,0) = _rates_sp(2);
+
+	for(int i=0;i<2;i++)
+	{
+		_temp15 = _Rs * _des;
+		_temp15 -= _P * _Xf;
+		_temp6  = _H_trans * _temp15;
+		for (int j = 0; j < 6; j++) _F(j) = -2.f * _temp6(j,0);
+
+		_d_local = _dd + _dupast * _u;
+
+		QPhild();
+
+		_delta_first(0,0) = _DeltaU(0);
+		_delta_first(1,0) = _DeltaU(1);
+		_delta_first(2,0) = _DeltaU(2);
+
+		_u += _delta_first;
+
+		// NaN guard before constrain
+		if (!PX4_ISFINITE(_u(0,0)) || !PX4_ISFINITE(_u(1,0)) || !PX4_ISFINITE(_u(2,0))) {
+			PX4_ERR("MPC: NaN in _u, resetting");
+			reset_mpc_state();
+			break;
+		}
+
+		// Clamp u to hard physical limits before state propagation.
+		// This prevents constraint violation from accumulating in _x.
+		_u(0,0) = math::constrain(_u(0,0), -0.7794f,  0.7794f);
+		_u(1,0) = math::constrain(_u(1,0), -0.7794f,  0.7794f);
+		_u(2,0) = math::constrain(_u(2,0), -0.1935f,  0.1935f);
+
+		_x_prev = _x;
+		_x = _Ad * _x + _Bd * _u;
+		_y_out = _Cd * _x;
+
+		_x_diff = _x - _x_prev;
+
+		for (int k = 0; k < 6; k++) _Xf(k,0) = _x_diff(k,0);
+		_Xf(6,0) = _y_out(0,0);
+		_Xf(7,0) = _y_out(1,0);
+		_Xf(8,0) = _y_out(2,0);
+	}
+	// -----------------------------------------------------------------
+	// Output — saturate and normalise to [-1, 1]
+	// -----------------------------------------------------------------
+
+	// The clamping above already ensures _u is within [−umax, +umax].
+	_att_control(0) = _u(0,0);
+	_att_control(1) = _u(1,0);
+	_att_control(2) = _u(2,0);
+
+	const float umax[3] = {0.7794f, 0.7794f, 0.1935f};
+
+	for (int k = 0; k < 3; k++) {
+		const float range = 2.f * umax[k];
+		// range is always > 0 for our umax values, but guard anyway
+		if (range > 1e-6f)
+			_att_control(k) = 2.f * ((_u(k,0) + umax[k]) / range) - 1.f;
+		else
+			_att_control(k) = 0.f;
+	}
+}
+
+// =============================================================================
+// THROTTLE CURVE
+// =============================================================================
+
 float
 MulticopterAttitudeControl::throttle_curve(float throttle_stick_input)
 {
-	// throttle_stick_input is in range [0, 1]
-	switch (_param_mpc_thr_curve.get()) {
-	case 1: // no rescaling to hover throttle
-		return math::interpolate(throttle_stick_input, 0.f, 1.f, _param_mpc_manthr_min.get(), _param_mpc_thr_max.get());
+	float thrust = 0.f;
 
-	default: // 0 or other: rescale to hover throttle at 0.5 stick
-		return math::interpolateN(throttle_stick_input, {_param_mpc_manthr_min.get(), _param_mpc_thr_hover.get(), _param_mpc_thr_max.get()});
+	switch (_param_mpc_thr_curve.get()) {
+	case 1:
+		thrust = math::interpolate(throttle_stick_input, -1.f, 1.f,
+			_manual_throttle_minimum.getState(), _param_mpc_thr_max.get());
+		break;
+	case 2:
+		thrust = math::interpolateNXY(throttle_stick_input,
+			{-1.f, 0.f, 1.f},
+			{_manual_throttle_minimum.getState(), _param_mpc_thr_hover.get(), _param_mpc_thr_max.get()});
+		break;
+	default:
+		thrust = math::interpolateNXY(throttle_stick_input,
+			{-1.f, 0.f, 1.f},
+			{_manual_throttle_minimum.getState(), _hover_thrust_slew_rate.getState(), _param_mpc_thr_max.get()});
+		break;
 	}
+
+	return math::min(thrust, _manual_throttle_maximum.getState());
 }
 
+// =============================================================================
+// ATTITUDE SETPOINT GENERATOR
+// =============================================================================
+
 void
-MulticopterAttitudeControl::generate_attitude_setpoint(const Quatf &q, float dt, bool reset_yaw_sp)
+MulticopterAttitudeControl::generate_attitude_setpoint(const Quatf &q, float dt)
 {
 	vehicle_attitude_setpoint_s attitude_setpoint{};
+
+	const bool arming_gesture = (_manual_control_setpoint.throttle < -.9f) && (_param_mc_airmode.get() != 2);
+	if (arming_gesture) { _man_yaw_sp = NAN; }
+
 	const float yaw = Eulerf(q).psi();
+	const float yaw_stick_input = math::expo_deadzone(_manual_control_setpoint.yaw, .6f, _param_man_deadzone.get());
+	_stick_yaw.generateYawSetpoint(attitude_setpoint.yaw_sp_move_rate, _man_yaw_sp,
+	                               yaw_stick_input, yaw, _heading_good_for_control, dt);
 
-	attitude_setpoint.yaw_sp_move_rate = _manual_control_setpoint.yaw * math::radians(_param_mpc_man_y_max.get());
-
-	// Avoid accumulating absolute yaw error with arming stick gesture in case heading_good_for_control stays true
-	if ((_manual_control_setpoint.throttle < -.9f) && (_param_mc_airmode.get() != 2)) {
-		reset_yaw_sp = true;
-	}
-
-	// Make sure not absolute heading error builds up
-	if (reset_yaw_sp) {
-		_man_yaw_sp = yaw;
-
-	} else {
-		_man_yaw_sp = wrap_pi(_man_yaw_sp + attitude_setpoint.yaw_sp_move_rate * dt);
-	}
-
-	/*
-	 * Input mapping for roll & pitch setpoints
-	 * ----------------------------------------
-	 * We control the following 2 angles:
-	 * - tilt angle, given by sqrt(roll*roll + pitch*pitch)
-	 * - the direction of the maximum tilt in the XY-plane, which also defines the direction of the motion
-	 *
-	 * This allows a simple limitation of the tilt angle, the vehicle flies towards the direction that the stick
-	 * points to, and changes of the stick input are linear.
-	 */
 	_man_roll_input_filter.setParameters(dt, _param_mc_man_tilt_tau.get());
 	_man_pitch_input_filter.setParameters(dt, _param_mc_man_tilt_tau.get());
 
-	// we want to fly towards the direction of (roll, pitch)
-	Vector2f v = Vector2f(_man_roll_input_filter.update(_manual_control_setpoint.roll * _man_tilt_max),
-			      -_man_pitch_input_filter.update(_manual_control_setpoint.pitch * _man_tilt_max));
-	float v_norm = v.norm(); // the norm of v defines the tilt angle
+	Vector2f v = Vector2f(
+		 _man_roll_input_filter.update(_manual_control_setpoint.roll  * _man_tilt_max),
+		-_man_pitch_input_filter.update(_manual_control_setpoint.pitch * _man_tilt_max));
 
-	if (v_norm > _man_tilt_max) { // limit to the configured maximum tilt angle
-		v *= _man_tilt_max / v_norm;
-	}
+	float v_norm = v.norm();
+	if (v_norm > _man_tilt_max) { v *= _man_tilt_max / v_norm; }
 
 	Quatf q_sp_rp = AxisAnglef(v(0), v(1), 0.f);
-	// The axis angle can change the yaw as well (noticeable at higher tilt angles).
-	// This is the formula by how much the yaw changes:
-	//   let a := tilt angle, b := atan(y/x) (direction of maximum tilt)
-	//   yaw = atan(-2 * sin(b) * cos(b) * sin^2(a/2) / (1 - 2 * cos^2(b) * sin^2(a/2))).
-	const Quatf q_sp_yaw(cosf(_man_yaw_sp / 2.f), 0.f, 0.f, sinf(_man_yaw_sp / 2.f));
+	const float yaw_setpoint = PX4_ISFINITE(_man_yaw_sp) ? _man_yaw_sp : yaw;
+	const Quatf q_sp_yaw(cosf(yaw_setpoint / 2.f), 0.f, 0.f, sinf(yaw_setpoint / 2.f));
 
 	if (_vtol) {
-		// Modify the setpoints for roll and pitch such that they reflect the user's intention even
-		// if a large yaw error(yaw_sp - yaw) is present. In the presence of a yaw error constructing
-		// an attitude setpoint from the yaw setpoint will lead to unexpected attitude behaviour from
-		// the user's view as the tilt will not be aligned with the heading of the vehicle.
-
 		AttitudeControlMath::correctTiltSetpointForYawError(q_sp_rp, q, q_sp_yaw);
 	}
 
-	// Align the desired tilt with the yaw setpoint
 	Quatf q_sp = q_sp_yaw * q_sp_rp;
-
 	q_sp.copyTo(attitude_setpoint.q_d);
 
-	// Transform to euler angles for logging only
-	const Eulerf euler_sp(q_sp);
-	attitude_setpoint.roll_body = euler_sp(0);
-	attitude_setpoint.pitch_body = euler_sp(1);
-	attitude_setpoint.yaw_body = euler_sp(2);
-
-	attitude_setpoint.thrust_body[2] = -throttle_curve((_manual_control_setpoint.throttle + 1.f) * .5f);
+	attitude_setpoint.thrust_body[2] = -throttle_curve(_manual_control_setpoint.throttle);
 	attitude_setpoint.timestamp = hrt_absolute_time();
-
 	_vehicle_attitude_setpoint_pub.publish(attitude_setpoint);
-
-	// update attitude controller setpoint immediately
-	_attitude_control.setAttitudeSetpoint(q_sp, attitude_setpoint.yaw_sp_move_rate);
-	_thrust_setpoint_body = Vector3f(attitude_setpoint.thrust_body);
-	_last_attitude_setpoint = attitude_setpoint.timestamp;
 }
+
+// =============================================================================
+// MAIN RUN LOOP
+// =============================================================================
 
 void
 MulticopterAttitudeControl::Run()
@@ -200,158 +541,182 @@ MulticopterAttitudeControl::Run()
 
 	perf_begin(_loop_perf);
 
-	// Check if parameters have changed
 	if (_parameter_update_sub.updated()) {
-		// clear update
 		parameter_update_s param_update;
 		_parameter_update_sub.copy(&param_update);
-
 		updateParams();
 		parameters_updated();
 	}
 
-	// run controller on attitude updates
+	if (_hover_thrust_estimate_sub.updated()) {
+		hover_thrust_estimate_s hover_thrust_estimate;
+		if (_hover_thrust_estimate_sub.update(&hover_thrust_estimate)) {
+			if (hover_thrust_estimate.valid) {
+				_hover_thrust_estimate = math::constrain(hover_thrust_estimate.hover_thrust, .05f, .9f);
+			} else {
+				_hover_thrust_estimate = _param_mpc_thr_hover.get();
+			}
+		}
+	}
+
 	vehicle_attitude_s v_att;
 
 	if (_vehicle_attitude_sub.update(&v_att)) {
 
-		// Guard against too small (< 0.2ms) and too large (> 20ms) dt's.
-		const float dt = math::constrain(((v_att.timestamp_sample - _last_run) * 1e-6f), 0.0002f, 0.02f);
+		const float dt = math::constrain(
+			((v_att.timestamp_sample - _last_run) * 1e-6f), 0.0002f, 0.02f);
 		_last_run = v_att.timestamp_sample;
 
 		const Quatf q{v_att.q};
 
-		// Check for new attitude setpoint
-		if (_vehicle_attitude_setpoint_sub.updated()) {
-			vehicle_attitude_setpoint_s vehicle_attitude_setpoint;
-
-			if (_vehicle_attitude_setpoint_sub.copy(&vehicle_attitude_setpoint)
-			    && (vehicle_attitude_setpoint.timestamp > _last_attitude_setpoint)) {
-
-				_attitude_control.setAttitudeSetpoint(Quatf(vehicle_attitude_setpoint.q_d), vehicle_attitude_setpoint.yaw_sp_move_rate);
-				_thrust_setpoint_body = Vector3f(vehicle_attitude_setpoint.thrust_body);
-				_last_attitude_setpoint = vehicle_attitude_setpoint.timestamp;
-			}
-		}
-
-		// Check for a heading reset
-		if (_quat_reset_counter != v_att.quat_reset_counter) {
-			const Quatf delta_q_reset(v_att.delta_q_reset);
-
-			// for stabilized attitude generation only extract the heading change from the delta quaternion
-			_man_yaw_sp = wrap_pi(_man_yaw_sp + Eulerf(delta_q_reset).psi());
-
-			if (v_att.timestamp > _last_attitude_setpoint) {
-				// adapt existing attitude setpoint unless it was generated after the current attitude estimate
-				_attitude_control.adaptAttitudeSetpoint(delta_q_reset);
-			}
-
-			_quat_reset_counter = v_att.quat_reset_counter;
-		}
-
-		/* check for updates in other topics */
 		_manual_control_setpoint_sub.update(&_manual_control_setpoint);
 		_vehicle_control_mode_sub.update(&_vehicle_control_mode);
 
 		if (_vehicle_status_sub.updated()) {
 			vehicle_status_s vehicle_status;
-
 			if (_vehicle_status_sub.copy(&vehicle_status)) {
 				_vehicle_type_rotary_wing = (vehicle_status.vehicle_type == vehicle_status_s::VEHICLE_TYPE_ROTARY_WING);
-				_vtol = vehicle_status.is_vtol;
-				_vtol_in_transition_mode = vehicle_status.in_transition_mode;
-				_vtol_tailsitter = vehicle_status.is_vtol_tailsitter;
+				_vtol                     = vehicle_status.is_vtol;
+				_vtol_in_transition_mode  = vehicle_status.in_transition_mode;
+				_vtol_tailsitter          = vehicle_status.is_vtol_tailsitter;
+				const bool armed = (vehicle_status.arming_state == vehicle_status_s::ARMING_STATE_ARMED);
+				const bool just_disarmed = _last_armed_state && !armed;
+				_last_armed_state = armed;
+				_spooled_up = armed && hrt_elapsed_time(&vehicle_status.armed_time) > _param_com_spoolup_time.get() * 1_s;
+				if (just_disarmed) { reset_mpc_state(); }
+			}
+		}
 
+		if (_vehicle_land_detected_sub.updated()) {
+			vehicle_land_detected_s vehicle_land_detected;
+			if (_vehicle_land_detected_sub.copy(&vehicle_land_detected)) {
+				const bool just_landed = !_landed && vehicle_land_detected.landed;
+				_landed = vehicle_land_detected.landed;
+				if (just_landed) { reset_mpc_state(); }
 			}
 		}
 
 		if (_vehicle_local_position_sub.updated()) {
 			vehicle_local_position_s vehicle_local_position;
-
 			if (_vehicle_local_position_sub.copy(&vehicle_local_position)) {
 				_heading_good_for_control = vehicle_local_position.heading_good_for_control;
 			}
 		}
 
-		bool attitude_setpoint_generated = false;
-
-		const bool is_hovering = (_vehicle_type_rotary_wing && !_vtol_in_transition_mode);
-
-		// vehicle is a tailsitter in transition mode
-		const bool is_tailsitter_transition = (_vtol_tailsitter && _vtol_in_transition_mode);
-
-		bool run_att_ctrl = _vehicle_control_mode.flag_control_attitude_enabled && (is_hovering || is_tailsitter_transition);
+		const bool is_hovering            = (_vehicle_type_rotary_wing && !_vtol_in_transition_mode);
+		const bool is_tailsitter_transition= (_vtol_tailsitter && _vtol_in_transition_mode);
+		const bool run_att_ctrl            = _vehicle_control_mode.flag_control_attitude_enabled
+		                                     && (is_hovering || is_tailsitter_transition);
 
 		if (run_att_ctrl) {
-
-			// Generate the attitude setpoint from stick inputs if we are in Manual/Stabilized mode
-			if (_vehicle_control_mode.flag_control_manual_enabled &&
-			    !_vehicle_control_mode.flag_control_altitude_enabled &&
-			    !_vehicle_control_mode.flag_control_velocity_enabled &&
-			    !_vehicle_control_mode.flag_control_position_enabled) {
-
-				generate_attitude_setpoint(q, dt, _reset_yaw_sp);
-				attitude_setpoint_generated = true;
-
+			if (_vehicle_control_mode.flag_control_manual_enabled
+			    && !_vehicle_control_mode.flag_control_altitude_enabled
+			    && !_vehicle_control_mode.flag_control_velocity_enabled
+			    && !_vehicle_control_mode.flag_control_position_enabled) {
+				generate_attitude_setpoint(q, dt);
 			} else {
 				_man_roll_input_filter.reset(0.f);
 				_man_pitch_input_filter.reset(0.f);
+				_man_yaw_sp = Eulerf(q).psi();
 			}
 
-			Vector3f rates_sp = _attitude_control.update(q);
+			if (_vehicle_attitude_setpoint_sub.updated()) {
+				vehicle_attitude_setpoint_s vehicle_attitude_setpoint;
+				if (_vehicle_attitude_setpoint_sub.copy(&vehicle_attitude_setpoint)
+				    && (vehicle_attitude_setpoint.timestamp > _last_attitude_setpoint)) {
+					_attitude_control.setAttitudeSetpoint(
+						Quatf(vehicle_attitude_setpoint.q_d),
+						vehicle_attitude_setpoint.yaw_sp_move_rate);
+					_thrust_setpoint_body  = Vector3f(vehicle_attitude_setpoint.thrust_body);
+					_last_attitude_setpoint = vehicle_attitude_setpoint.timestamp;
+				}
+			}
+
+			// Outer Attitude P-loop → desired angular rates
+			_rates_sp = _attitude_control.update(q);
+
+			if (_quat_reset_counter != v_att.quat_reset_counter) {
+				const Quatf delta_q_reset(v_att.delta_q_reset);
+				const float delta_psi = Eulerf(delta_q_reset).psi();
+				if (PX4_ISFINITE(_man_yaw_sp)) {
+					_man_yaw_sp = wrap_pi(_man_yaw_sp + delta_psi);
+				}
+				if (v_att.timestamp > _last_attitude_setpoint) {
+					_attitude_control.adaptAttitudeSetpoint(delta_q_reset);
+				}
+				_quat_reset_counter = v_att.quat_reset_counter;
+			}
+
+			// MPC inner-loop rate controller
+			vehicle_angular_velocity_s ang_vel{};
+			if (_vehicle_angular_velocity_sub.copy(&ang_vel)) {
+				matrix::Vector3f rates(ang_vel.xyz[0], ang_vel.xyz[1], ang_vel.xyz[2]);
+				control_attitude_rates(dt, rates, q);
+
+				_rates_sp = Vector3f(_att_control(0), _att_control(1), _att_control(2));
+			}
 
 			const hrt_abstime now = hrt_absolute_time();
 			autotune_attitude_control_status_s pid_autotune;
-
 			if (_autotune_attitude_control_status_sub.copy(&pid_autotune)) {
 				if ((pid_autotune.state == autotune_attitude_control_status_s::STATE_ROLL
 				     || pid_autotune.state == autotune_attitude_control_status_s::STATE_PITCH
 				     || pid_autotune.state == autotune_attitude_control_status_s::STATE_YAW
 				     || pid_autotune.state == autotune_attitude_control_status_s::STATE_TEST)
 				    && ((now - pid_autotune.timestamp) < 1_s)) {
-					rates_sp += Vector3f(pid_autotune.rate_sp);
+					_rates_sp += Vector3f(pid_autotune.rate_sp);
 				}
 			}
 
-			// publish rate setpoint
 			vehicle_rates_setpoint_s rates_setpoint{};
-			rates_setpoint.roll = rates_sp(0);
-			rates_setpoint.pitch = rates_sp(1);
-			rates_setpoint.yaw = rates_sp(2);
+			rates_setpoint.roll  = _rates_sp(0);
+			rates_setpoint.pitch = _rates_sp(1);
+			rates_setpoint.yaw   = _rates_sp(2);
 			_thrust_setpoint_body.copyTo(rates_setpoint.thrust_body);
 			rates_setpoint.timestamp = hrt_absolute_time();
-
 			_vehicle_rates_setpoint_pub.publish(rates_setpoint);
+
+		} else {
+			_man_roll_input_filter.reset(0.f);
+			_man_pitch_input_filter.reset(0.f);
+			_man_yaw_sp = Eulerf(q).psi();
 		}
 
-		// reset yaw setpoint during transitions, tailsitter.cpp generates
-		// attitude setpoint for the transition
-		_reset_yaw_sp = !attitude_setpoint_generated || !_heading_good_for_control || (_vtol && _vtol_in_transition_mode);
+		if (_landed) {
+			_manual_throttle_minimum.update(0.f, dt);
+		} else {
+			_manual_throttle_minimum.update(_param_mpc_manthr_min.get(), dt);
+		}
+
+		if (_spooled_up) {
+			_manual_throttle_maximum.update(1.f, dt);
+		} else {
+			_manual_throttle_maximum.setForcedValue(0.f);
+		}
+
+		if (PX4_ISFINITE(_hover_thrust_estimate)) {
+			_hover_thrust_slew_rate.update(_hover_thrust_estimate, dt);
+		}
 	}
 
 	perf_end(_loop_perf);
 }
 
+// =============================================================================
+// MODULE BOILERPLATE
+// =============================================================================
+
 int MulticopterAttitudeControl::task_spawn(int argc, char *argv[])
 {
 	bool vtol = false;
-
-	if (argc > 1) {
-		if (strcmp(argv[1], "vtol") == 0) {
-			vtol = true;
-		}
-	}
+	if (argc > 1 && strcmp(argv[1], "vtol") == 0) { vtol = true; }
 
 	MulticopterAttitudeControl *instance = new MulticopterAttitudeControl(vtol);
 
 	if (instance) {
 		_object.store(instance);
 		_task_id = task_id_is_work_queue;
-
-		if (instance->init()) {
-			return PX4_OK;
-		}
-
+		if (instance->init()) { return PX4_OK; }
 	} else {
 		PX4_ERR("alloc failed");
 	}
@@ -359,7 +724,6 @@ int MulticopterAttitudeControl::task_spawn(int argc, char *argv[])
 	delete instance;
 	_object.store(nullptr);
 	_task_id = -1;
-
 	return PX4_ERROR;
 }
 
@@ -370,39 +734,21 @@ int MulticopterAttitudeControl::custom_command(int argc, char *argv[])
 
 int MulticopterAttitudeControl::print_usage(const char *reason)
 {
-	if (reason) {
-		PX4_WARN("%s\n", reason);
-	}
+	if (reason) { PX4_WARN("%s\n", reason); }
 
 	PRINT_MODULE_DESCRIPTION(
 		R"DESCR_STR(
 ### Description
-This implements the multicopter attitude controller. It takes attitude
-setpoints (`vehicle_attitude_setpoint`) as inputs and outputs a rate setpoint.
-
-The controller has a P loop for angular error
-
-Publication documenting the implemented Quaternion Attitude Control:
-Nonlinear Quadrocopter Attitude Control (2013)
-by Dario Brescianini, Markus Hehn and Raffaello D'Andrea
-Institute for Dynamic Systems and Control (IDSC), ETH Zurich
-
-https://www.research-collection.ethz.ch/bitstream/handle/20.500.11850/154099/eth-7387-01.pdf
-
+Multicopter attitude controller with MPC inner-loop rate controller.
 )DESCR_STR");
 
 	PRINT_MODULE_USAGE_NAME("mc_att_control", "controller");
 	PRINT_MODULE_USAGE_COMMAND("start");
 	PRINT_MODULE_USAGE_ARG("vtol", "VTOL mode", true);
 	PRINT_MODULE_USAGE_DEFAULT_COMMANDS();
-
 	return 0;
 }
 
-
-/**
- * Multicopter attitude control app start / stop handling function
- */
 extern "C" __EXPORT int mc_att_control_main(int argc, char *argv[])
 {
 	return MulticopterAttitudeControl::main(argc, argv);
