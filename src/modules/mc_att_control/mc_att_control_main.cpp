@@ -143,9 +143,6 @@ MulticopterAttitudeControl::MulticopterAttitudeControl(bool vtol) :
 
 	// ----- P matrix (15x9) -----
 	static const float P_data[15][9] = {
-		{0,0,0,0,0,0,1,0,0},
-		{0,0,0,0,0,0,0,1,0},
-		{0,0,0,0,0,0,0,0,1},
 		{0,1,0,0,0,0,1,0,0},
 		{0,0,0,1,0,0,0,1,0},
 		{0,0,0,0,0,1,0,0,1},
@@ -157,7 +154,10 @@ MulticopterAttitudeControl::MulticopterAttitudeControl(bool vtol) :
 		{0,0,0,0,0,3,0,0,1},
 		{0,4,0,0,0,0,1,0,0},
 		{0,0,0,4,0,0,0,1,0},
-		{0,0,0,0,0,4,0,0,1}
+		{0,0,0,0,0,4,0,0,1},
+		{0,5,0,0,0,0,1,0,0},
+		{0,0,0,5,0,0,0,1,0},
+		{0,0,0,0,0,5,0,0,1}
 	};
 	_P.zero();
 	for (int i = 0; i < 15; i++)
@@ -202,8 +202,8 @@ MulticopterAttitudeControl::MulticopterAttitudeControl(bool vtol) :
 	static const float dd_data[24] = {
 		0.4796f,0.4796f,0.1161f, 0.4796f,0.4796f,0.1161f,
 		0.4796f,0.4796f,0.1161f, 0.4796f,0.4796f,0.1161f,
-		0.7794f,0.7794f,0.1935f, 0.7794f,0.7794f,0.1935f,
-		0.7794f,0.7794f,0.1935f, 0.7794f,0.7794f,0.1935f
+		0.7994f,0.7994f,0.1935f, 0.7994f,0.7994f,0.1935f,
+		0.7994f,0.7994f,0.1935f, 0.7994f,0.7994f,0.1935f
 	};
 	_dd.zero();
 	for (int i = 0; i < 24; i++) _dd(i,0) = dd_data[i];
@@ -326,7 +326,7 @@ void MulticopterAttitudeControl::QPhild()
 		_lambda_prev(i) = 0.f;
 	}
 
-	for (int km = 0; km < 10; km++) {
+	for (int km = 0; km < 15; km++) {
 		for (int i = 0; i < 24; i++) _lambda_prev(i) = _lambda(i);
 
 		for (int i = 0; i < 24; i++) {
@@ -418,8 +418,8 @@ void MulticopterAttitudeControl::control_attitude_rates(float dt,
 
 		// Clamp u to hard physical limits before state propagation.
 		// This prevents constraint violation from accumulating in _x.
-		_u(0,0) = math::constrain(_u(0,0), -0.7794f,  0.7794f);
-		_u(1,0) = math::constrain(_u(1,0), -0.7794f,  0.7794f);
+		_u(0,0) = math::constrain(_u(0,0), -0.7994f,  0.7994f);
+		_u(1,0) = math::constrain(_u(1,0), -0.7994f,  0.7994f);
 		_u(2,0) = math::constrain(_u(2,0), -0.1935f,  0.1935f);
 
 		_x_prev = _x;
@@ -442,7 +442,7 @@ void MulticopterAttitudeControl::control_attitude_rates(float dt,
 	_att_control(1) = _u(1,0);
 	_att_control(2) = _u(2,0);
 
-	const float umax[3] = {0.7794f, 0.7794f, 0.1935f};
+	const float umax[3] = {0.7994f, 0.7994f, 0.1935f};
 
 	for (int k = 0; k < 3; k++) {
 		const float range = 2.f * umax[k];
